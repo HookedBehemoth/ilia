@@ -2,9 +2,6 @@
 #include<iterator>
 #include<vector>
 
-#include<libtransistor/cpp/nx.hpp>
-
-#include<malloc.h>
 #include<string.h>
 #include<stdio.h>
 #include<stdlib.h>
@@ -12,6 +9,7 @@
 
 #include "pcapng.hpp"
 #include "err.hpp"
+#include "assert.hpp"
 
 namespace ilia {
 namespace pcapng {
@@ -29,7 +27,7 @@ void Writer::CommitBlock() {
    ((uint32_t*) block_buffer.data())[1] = block_buffer.size();
    *((uint32_t*) (block_buffer.data() + block_buffer.size() - 4)) = block_buffer.size();
    if(fwrite(block_buffer.data(), 1, block_buffer.size(), file) != block_buffer.size()) {
-      throw trn::ResultError(ILIA_ERR_IO_ERROR);
+      throw ResultError(ILIA_ERR_IO_ERROR);
    }
    fflush(file);
 }

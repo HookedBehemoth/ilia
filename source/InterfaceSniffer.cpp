@@ -78,10 +78,11 @@ static void MakeChunk(util::Buffer &message, ChunkType type, T &t) {
 }
 
 InterfaceSniffer::MessageContext::~MessageContext() {
+	try {
 	//fprintf(stderr, "leaving message handling context for thread 0x%lx\n", thread.thread_id);
 	message = {vtable.real_vtable_addr}; // restore vtable
 
-	uint32_t result = (uint32_t) thread.GetContext().x[0];
+	uint32_t result = (uint32_t) thread.GetContext().cpu_gprs[0].x;
 
 	// commit message
 	util::Buffer message;
@@ -118,7 +119,12 @@ InterfaceSniffer::MessageContext::~MessageContext() {
 		AddChunk(message, ChunkType::Buffers, chunk);
 	}
 
-	owner.ilia.pcap_writer.WriteEPB(owner.interface_id, 0, message.ReadAvailable(), message.ReadAvailable(), message.Read(), nullptr);
+	owner.ilia.pcap_writer.WriteEPB(owner.interface_id, armTicksToNs(armGetSystemTick()), message.ReadAvailable(), message.ReadAvailable(), message.Read(), nullptr);
+	} catch (std::exception &e) {
+		fprintf(stderr, "caught exception %s\n", e.what());
+	} catch (...) {
+		fprintf(stderr, "caught exception\n");
+	}
 }
 
 InterfaceSniffer::MessageContext::PrepareForProcess::PrepareForProcess(

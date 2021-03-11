@@ -1,13 +1,13 @@
 #include "Process.hpp"
 
+#include<elf.h>
 #include<stdio.h>
 
 #include<map>
 
-#include<libtransistor/cpp/nx.hpp>
+#include<cxxabi.h>
 
-#include "libiberty/include/demangle.h"
-
+#include "assert.hpp"
 #include "err.hpp"
 
 #include "Ilia.hpp"
@@ -15,8 +15,6 @@
 #include "InterfaceSniffer.hpp"
 
 namespace ilia {
-
-using namespace trn;
 
 struct ModHeader {
 	uint32_t magic, dynamic_off, bss_start_off, bss_end_off;
@@ -26,12 +24,9 @@ struct ModHeader {
 Process::Process(
 	Ilia &ilia,
 	uint64_t pid) :
-	ilia(ilia), pid(pid),
-	debug(ResultCode::AssertOk(svc::DebugActiveProcess(pid))),
-	wait_handle(
-		ilia.event_waiter.Add(
-			debug,
-			[this]() -> bool { HandleEvents(); return true; })) {
+	ilia(ilia), pid(pid) {
+	ResultCode::AssertOk(svcDebugActiveProcess(&debug, pid));
+	ilia.event_waiter.Add(debug, [this] { HandleEvents(); });
 }
 
 Process::Thread::Thread(Process &process, uint64_t id, uint64_t tls, uint64_t entrypoint) :
@@ -41,10 +36,10 @@ Process::Thread::Thread(Process &process, uint64_t id, uint64_t tls, uint64_t en
 	entrypoint(entrypoint) {
 }
 
-nx::ThreadContext &Process::Thread::GetContext() {
+ThreadContext &Process::Thread::GetContext() {
 	if(!is_context_valid) {
-		*((thread_context_t*) (&context)) = ResultCode::AssertOk(
-			svc::GetDebugThreadContext(process.debug, thread_id, 15));
+		ResultCode::AssertOk(
+			svcGetDebugThreadContext(&context, process.debug, thread_id, RegisterGroup_All));
 		is_context_valid = true;
 	}
 	is_context_dirty = true;
@@ -54,7 +49,7 @@ nx::ThreadContext &Process::Thread::GetContext() {
 void Process::Thread::CommitContext() {
 	if(is_context_dirty) {
 		ResultCode::AssertOk(
-			svc::SetDebugThreadContext(process.debug, thread_id, (thread_context_t*) &context, 3));
+			svcSetDebugThreadContext(process.debug, thread_id, &context, RegisterGroup_CpuAll));
 		is_context_dirty = false;
 	}
 }
@@ -114,13 +109,10 @@ std::unique_ptr<InterfaceSniffer> Process::Sniff(std::string name, uint64_t offs
 }
 
 void Process::HandleEvents() {
-	trn::Result<debug_event_info_t> r;
-	
-	while((r = svc::GetDebugEvent(debug))) {
-		nx::DebugEvent event = {};
-		static_assert(sizeof(event) == sizeof(*r));
-		memcpy((void*) &event, (void*) &(*r), sizeof(event));
-		
+	nx::DebugEvent event = {};
+	Result rc=0;
+
+	while(R_SUCCEEDED(rc = svcGetDebugEvent(&event, debug))) {
 		switch(event.event_type) {
 		case nx::DebugEvent::EventType::AttachProcess: {
 			if(has_attached) {
@@ -172,7 +164,7 @@ void Process::HandleEvents() {
 				fprintf(stderr, "got debugger attachment exception\n");
 				break; }
 			default:
-				fprintf(stderr, "ERROR: unhandled exception\n");
+				fprintf(stderr, "ERROR: unhandled exception: %d\n", static_cast<uint32_t>(event.exception.exception_type));
 				return;
 			}
 			break; }
@@ -182,16 +174,22 @@ void Process::HandleEvents() {
 		}
 	}
 	
-	if(r.error().code != 0x8c01) { // no events left
-		throw r.error();
+	if(R_VALUE(rc) != KERNELRESULT(OutOfDebugEvents)) {
+		throw ResultError(rc);
 	}
 
 	for(auto &i : threads) {
 		i.second.CommitContext();
 		i.second.InvalidateContext();
 	}
-	ResultCode::AssertOk(
-		svc::ContinueDebugEvent(debug, 7, nullptr, 0));
+
+	if (hosversionAtLeast(3,0,0)) {
+		ResultCode::AssertOk(
+			svcContinueDebugEvent(debug, 7, nullptr, 0));
+	} else {
+		ResultCode::AssertOk(
+			svcLegacyContinueDebugEvent(debug, 7, 0));
+	}
 }
 
 uint64_t Process::RegisterTrap(Trap &t) {
@@ -231,51 +229,41 @@ uint64_t Process::TrapAddress(size_t index) {
 }
 
 void Process::ScanSTables() {
-	struct NsoInfo {
-		union {
-			uint8_t build_id[0x20];
-			uint64_t build_id_64[4];
-		};
-		uint64_t addr;
-		size_t size;
-	};
-	std::vector<NsoInfo> nso_infos(16, {0, 0, 0});
-	uint32_t num_nsos;
+	std::vector<LoaderModuleInfo> nso_infos(16, {{},0,0});
+	int32_t num_nsos;
 
    if(pid >= 0x50) {
 		 ResultCode::AssertOk(
-			 ilia.ldr_dmnt.SendSyncRequest<2>( // GetNsoInfos
-				 ipc::InRaw<uint64_t>(pid),
-				 ipc::OutRaw<uint32_t>(num_nsos),
-				 ipc::Buffer<NsoInfo, 0xA>(nso_infos)));
+			 ldrDmntGetProcessModuleInfo(pid, nso_infos.data(), nso_infos.size(), &num_nsos));
 	 } else {
 		 uint64_t addr = 0;
-		 memory_info_t mi;
-		 while((mi = std::get<0>(ResultCode::AssertOk(svc::QueryDebugProcessMemory(debug, addr)))).memory_type != 3) {
-			 if((uint64_t) mi.base_addr + mi.size < addr) {
+		 uint32_t pi = 0;
+		 MemoryInfo mi;
+		 while (ResultCode::AssertOk(svcQueryDebugProcessMemory(&mi, &pi, debug, addr)), mi.type != 3) {
+			 if((uint64_t) mi.addr + mi.size < addr) {
 				 fprintf(stderr, "giving up on finding module...\n");
 				 return;
 			 }
-			 addr = (uint64_t) mi.base_addr + mi.size;
+			 addr = (uint64_t) mi.addr + mi.size;
 		 }
 
 		 fprintf(stderr, "found module at 0x%lx\n", addr);
 		 
-		 nso_infos[0] = {.addr = addr};
+		 nso_infos[0] = {.base_address = addr};
 		 num_nsos = 1;
 	 }
 
-	 likely_aslr_base = nso_infos[0].addr;
+	 likely_aslr_base = nso_infos[0].base_address;
 
-	for(uint32_t i = 0; i < num_nsos; i++) {
-		NsoInfo &info = nso_infos[i];
-		NSO &nso = nsos.emplace_back(*this, info.addr, info.size);
+	for(int32_t i = 0; i < num_nsos; i++) {
+		LoaderModuleInfo &info = nso_infos[i];
+		nsos.emplace_back(*this, info.base_address, info.size);
 		
-		uint32_t mod_offset = Read<uint32_t>(info.addr + 4);
-		ModHeader hdr = Read<ModHeader>(info.addr + mod_offset);
+		uint32_t mod_offset = Read<uint32_t>(info.base_address + 4);
+		ModHeader hdr = Read<ModHeader>(info.base_address + mod_offset);
 
 		std::map<int64_t, Elf64_Dyn> dyn_map;
-		uint64_t dyn_addr = info.addr + mod_offset + hdr.dynamic_off;
+		uint64_t dyn_addr = info.base_address + mod_offset + hdr.dynamic_off;
 		for(Elf64_Dyn dyn; (dyn = Read<Elf64_Dyn>(dyn_addr)).d_tag != DT_NULL; dyn_addr+= sizeof(dyn)) {
 			dyn_map[dyn.d_tag] = dyn;
 		}
@@ -289,7 +277,7 @@ void Process::ScanSTables() {
 			continue;
 		}
 
-		RemotePointer<char> string_table = RemotePointer<char>(debug, info.addr + dyn_map[DT_STRTAB].d_val);
+		RemotePointer<char> string_table = RemotePointer<char>(debug, info.base_address + dyn_map[DT_STRTAB].d_un.d_val);
 		if(dyn_map.find(DT_SYMTAB) == dyn_map.end()) {
 			fprintf(stderr, "  couldn't find symbol table\n");
 			continue;
@@ -300,8 +288,8 @@ void Process::ScanSTables() {
 			continue;
 		}
 
-		uint32_t nchain = Access<uint32_t>(info.addr + dyn_map[DT_HASH].d_val)[1];
-		RemotePointer<Elf64_Sym> sym_table = Access<Elf64_Sym>(info.addr + dyn_map[DT_SYMTAB].d_val);
+		uint32_t nchain = Access<uint32_t>(info.base_address + dyn_map[DT_HASH].d_un.d_val)[1];
+		RemotePointer<Elf64_Sym> sym_table = Access<Elf64_Sym>(info.base_address + dyn_map[DT_SYMTAB].d_un.d_val);
 		for(uint32_t i = 0; i < nchain; i++) {
 			Elf64_Sym sym = sym_table[i];
 			if(sym.st_name != 0) {
@@ -317,8 +305,9 @@ void Process::ScanSTables() {
 					continue;
 				}
 				
-				char *demangled = cplus_demangle_v3(name.c_str(), 0);
-				name = demangled;
+				int status;
+				char *demangled = abi::__cxa_demangle(name.c_str(), 0, 0, &status);
+				name = status==0 ? demangled : name.c_str();
 				free(demangled);
             
 				static const char prefix[] = "nn::sf::cmif::server::detail::CmifProcessFunctionTableGetter<";
@@ -328,7 +317,7 @@ void Process::ScanSTables() {
 												sizeof(postfix) - 1, postfix) == 0) {
 					name = name.substr(sizeof(prefix) - 1, name.length() - sizeof(prefix) + 1 - sizeof(postfix) + 1);
 					fprintf(stderr, "  found s_Table: %s\n", name.c_str());
-					s_tables.emplace(name, STable(*this, name, info.addr + sym.st_value));
+					s_tables.emplace(name, STable(*this, name, info.base_address + sym.st_value));
 				} else {
 					fprintf(stderr, "  found non-matching s_Table: %s\n", name.c_str());
 				}

@@ -1,7 +1,6 @@
-*.o
-*.nro
-*.nro.so
-*~
-*.d
+*.elf
+*.nso
+*.npdm
+*.nsp
 *.pcapng
 build/

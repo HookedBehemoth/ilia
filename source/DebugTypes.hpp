@@ -25,17 +25,6 @@ namespace nx {
 
 using PageInfo = uint32_t;
 
-struct MemoryInfo {
-	uint64_t base_addr;
-	uint64_t size;
-	uint32_t memory_type;
-	uint32_t memory_attribute;
-	uint32_t permission;
-	uint32_t device_ref_count;
-	uint32_t ipc_ref_count;
-	uint32_t padding;
-};
-
 struct DebugEvent {
 	enum class EventType : uint32_t {
 		AttachProcess = 0,
@@ -51,7 +40,7 @@ struct DebugEvent {
 		TerminatedProcess = 3,
 	};
 	enum class ExceptionType : uint32_t {
-		Trap = 0,
+		UndefinedInstruction = 0,
 		InstructionAbort = 1,
 		DataAbortMisc = 2,
 		PcSpAlignmentFault = 3,
@@ -103,16 +92,6 @@ struct DebugEvent {
 			};
 		} exception;
 		uint8_t padding[0x80]; // not sure how large this actually needs to be, but let's be safe.
-	};
-};
-
-struct ThreadContext {
-	union {
-		uint64_t regs[100];
-		struct {
-			uint64_t x[31];
-			uint64_t sp, pc;
-		};
 	};
 };
 

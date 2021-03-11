@@ -34,7 +34,6 @@ namespace util {
 class Buffer {
 public:
 	Buffer();
-	Buffer(std::vector<uint8_t> data);
 	~Buffer();
 
 	// reserves at least `size` bytes, returns a tuple of

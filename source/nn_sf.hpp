@@ -12,7 +12,7 @@ struct PointerAndSize {
 } // namespace detail
 
 struct NativeHandle {
-	handle_t handle;
+	Handle handle;
 	bool valid;
 };
 
@@ -36,7 +36,7 @@ namespace server {
 
 struct CmifServerObjectInfo {
 	void *object;
-	result_t (**s_Table)(void*, void*, detail::PointerAndSize*);
+	Result (**s_Table)(void*, void*, detail::PointerAndSize*);
 };
 
 struct CmifServerMessage {

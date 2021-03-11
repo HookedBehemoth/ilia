@@ -21,6 +21,8 @@ const uint32_t LINKTYPE_USER1 = 148; // CMIF message
 class Writer {
   public:
    Writer(FILE *file);
+   Writer(Writer&) = delete;
+   Writer operator=(Writer&) = delete;
    
    void WriteSHB(Option *options);
    uint32_t WriteIDB(uint16_t link_type, uint32_t snap_len, Option *options);

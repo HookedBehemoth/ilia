@@ -1,7 +1,8 @@
 #pragma once
 
-#include<libtransistor/cpp/nx.hpp>
+#include<switch.h>
 
+#include "handle_handler.hpp"
 #include "Process.hpp"
 #include "pcapng.hpp"
 
@@ -14,14 +15,12 @@ class InterfaceSniffer;
 class Ilia {
   public:
    Ilia(FILE *pcap);
+   Ilia(Ilia&) = delete;
+   Ilia operator=(Ilia&) = delete;
    
    bool destroy_flag = false;
    pcapng::Writer pcap_writer;
-   trn::Waiter event_waiter;
-
-   trn::service::SM sm;
-   trn::ipc::client::Object ldr_dmnt;
-   trn::ipc::client::Object pm_dmnt;
+   HandleWaiter event_waiter;
 
    std::map<uint64_t, Process> processes;
    std::vector<std::unique_ptr<InterfaceSniffer>> sniffers;

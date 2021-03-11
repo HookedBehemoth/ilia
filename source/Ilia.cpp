@@ -1,24 +1,16 @@
 #include "Ilia.hpp"
-
-#include<libtransistor/cpp/ipc/sm.hpp>
-
-#include<libtransistor/err.h>
-#include<libtransistor/ipcserver.h>
-#include<libtransistor/ipc/bsd.h>
-#include<libtransistor/util.h>
-#include<libtransistor/svc.h>
+#include "scope_guard.hpp"
+#include "assert.hpp"
 
 #include<unistd.h>
 #include<stdio.h>
 #include<string.h>
-#include<malloc.h>
-#include<fcntl.h>
+#include<sys/iosupport.h>
 
 #include "ini.h"
 
 #include "err.hpp"
 #include "pcapng.hpp"
-#include "util.hpp"
 
 #include "Process.hpp"
 #include "InterfaceSniffer.hpp"
@@ -41,17 +33,7 @@ static int IniSectionHandler(void *user, const char *section, void **section_con
 		if(index != buf.size() - i - 1) {
 			return 0;
 		}
-		if(env_get_kernel_version() >= KERNEL_VERSION_500) {
-			ResultCode::AssertOk(
-				ilia.pm_dmnt.SendSyncRequest<2>(
-					ipc::InRaw<uint64_t>(tid),
-					ipc::OutRaw<uint64_t>(pid)));
-		} else {
-			ResultCode::AssertOk(
-				ilia.pm_dmnt.SendSyncRequest<3>(
-					ipc::InRaw<uint64_t>(tid),
-					ipc::OutRaw<uint64_t>(pid)));
-		}
+		ResultCode::AssertOk(pmdmntGetProcessId(&pid, tid));
 	} else if(buf.substr(0, i) == "pid") {
 		size_t index;
 		pid = std::stoull(buf.substr(i+1), &index, 0);
@@ -96,64 +78,115 @@ static int IniValueHandler(void *user, void *section_context, const char *name, 
 	return 1;
 }
 
-class Time {
- public:
-	Time() {
-		ResultCode::AssertOk(time_init());
+extern "C" void __libnx_initheap(void) {
+    static char nx_inner_heap[0x100000];
+
+    extern char *fake_heap_start;
+    extern char *fake_heap_end;
+    fake_heap_start = nx_inner_heap;
+    fake_heap_end   = nx_inner_heap + sizeof(nx_inner_heap);
+}
+
+extern "C" void __appInit(void) {
+	Result rc=0;
+
+	rc = smInitialize();
+	if (R_SUCCEEDED(rc)) rc = setsysInitialize();
+	if (R_SUCCEEDED(rc)) {
+		SetSysFirmwareVersion version;
+		setsysGetFirmwareVersion(&version);
+		hosversionSet(MAKEHOSVERSION(version.major, version.minor, version.micro));
+		setsysExit();
 	}
-	~Time() {
-		time_finalize();
-	}
-	uint64_t GetCurrentTime() {
-		uint64_t t;
-		ResultCode::AssertOk(time_system_clock_get_current_time(time_system_clock_local, &t));
-		return t;
-	}
-};
+	if (R_SUCCEEDED(rc)) rc = timeInitialize();
+	if (R_SUCCEEDED(rc)) rc = pmdmntInitialize();
+	if (R_SUCCEEDED(rc)) rc = ldrDmntInitialize();
+	if (R_SUCCEEDED(rc)) rc = fsInitialize();
+	if (R_SUCCEEDED(rc)) rc = fsdevMountSdmc();
+	if (R_SUCCEEDED(rc)) rc = pscmInitialize();
+
+	if (R_FAILED(rc)) diagAbortWithResult(rc);
+
+	smExit();
+}
+
+extern "C" void __appExit(void) {
+	pscmExit();
+	fsExit();
+	ldrDmntExit();
+	pmdmntExit();
+	timeExit();
+}
+
+FILE* fp=nullptr;
+
+extern "C" void __libnx_exception_handler(ThreadExceptionDump *ctx) {
+    MemoryInfo mem_info; u32 page_info;
+    svcQueryMemory(&mem_info, &page_info, ctx->pc.x);
+	fprintf(fp, "%#x exception with pc=%#lx\n", ctx->error_desc, ctx->pc.x - mem_info.addr);
+	fclose(fp);
+}
 
 int main(int argc, char *argv[]) {
+	fp = fopen("/sd/log.txt", "a");
+	auto log_guard = SCOPE_GUARD { fclose(fp); };
+
+	constexpr devoptab_t dotab_stdout = {
+		.name    = "con",
+		.write_r = +[](struct _reent *r,void *fd,const char *ptr, size_t len) -> ssize_t {
+			fwrite(ptr, 1, len, fp);
+			return len;
+		},
+	};
+
+	devoptab_list[STD_OUT] = &dotab_stdout;
+	devoptab_list[STD_ERR] = &dotab_stdout;
+
 	try {
-		Time t;
+		time_t time=0;
+		timeGetCurrentTime(TimeType_Default, reinterpret_cast<u64*>(&time));
 		char fname[301];
-		time_t time = t.GetCurrentTime();
 		strftime(fname, sizeof(fname)-1, "/sd/ilia_%F_%H-%M-%S.pcapng", gmtime(&time));
 		fprintf(stderr, "opening '%s'...\n", fname);
 		FILE *log = fopen(fname, "wb");
+		auto pcapng_guard = SCOPE_GUARD { fclose(log); };
 		
 		ilia::Ilia ilia(log);
 
-		FILE *f = fopen("/sd/ilia.ini", "r");
-		if(!f) {
-			fprintf(stderr, "could not open configuration\n");
-			return 1;
-		}
+		{
+			FILE *f = fopen("/sd/ilia.ini", "r");
+			auto config_guard = SCOPE_GUARD { fclose(f); };
 
-		int error = ini_parse_file(f, &IniValueHandler, &IniSectionHandler, &ilia);
-		if(error != 0) {
-			fprintf(stderr, "ini error on line %d\n", error);
-			return 1;
+			if(!f) {
+				fprintf(stderr, "could not open configuration\n");
+				return 1;
+			}
+
+			int error = ini_parse_file(f, &IniValueHandler, &IniSectionHandler, &ilia);
+			if(error != 0) {
+				fprintf(stderr, "ini error on line %d\n", error);
+				return 1;
+			}
 		}
 		
-		while(!ilia.destroy_flag) {
-			trn::ResultCode::AssertOk(ilia.event_waiter.Wait(3000000000));
-		}
+		while(!ilia.destroy_flag && !ilia.event_waiter.Wait(3000000000));
 		fprintf(stderr, "ilia terminating\n");
    
 		return 0;
-	} catch(trn::ResultError &e) {
+	} catch(ResultError &e) {
 		fprintf(stderr, "caught ResultError: 0x%x\n", e.code.code);
-		return e.code.code;
+		// return e.code.code;
+	} catch (std::exception &e) {
+		fprintf(stderr, "caught exception %s\n", e.what());
+	} catch (...) {
+		fprintf(stderr, "caught exception\n");
 	}
 }
 
 namespace ilia {
 
 Ilia::Ilia(FILE *pcap) :
-	pcap_writer(pcap),
-	event_waiter(),
-	sm(trn::ResultCode::AssertOk(trn::service::SM::Initialize())),
-	ldr_dmnt(trn::ResultCode::AssertOk(sm.GetService("ldr:dmnt"))),
-	pm_dmnt(trn::ResultCode::AssertOk(sm.GetService("pm:dmnt"))) {
+	pcap_writer(pcap) {
 	static const char shb_hardware[] = "Nintendo Switch";
 	static const char shb_os[] = "Horizon";
 	static const char shb_userappl[] = "ilia";

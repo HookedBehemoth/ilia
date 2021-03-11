@@ -27,11 +27,7 @@ namespace ilia {
 namespace util {
 
 Buffer::Buffer() :
-	data(2 * 1024 * 1024, 0) {
-}
-
-Buffer::Buffer(std::vector<uint8_t> data) :
-	data(data), write_head(data.size()) {
+	data(256 * 1024, 0) {
 }
 
 Buffer::~Buffer() {

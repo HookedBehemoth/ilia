@@ -1,15 +1,11 @@
 #pragma once
 
-#include<libtransistor/cpp/nx.hpp>
-
 #include<tuple>
 #include<utility>
 
 #include "err.hpp"
 
 #include "Process.hpp"
-
-using namespace trn;
 
 namespace ilia {
 
@@ -39,10 +35,10 @@ class FunctionTrap {
 			throw ResultError(ILIA_ERR_NON_REENTRANT);
 		}
 		
-		nx::ThreadContext &ctx = t.GetContext();
-		uint64_t ret = ctx.x[30];
-		ctx.x[30] = exit_trap.trap_addr;
-		ctx.pc = target_addr;
+		ThreadContext &ctx = t.GetContext();
+		uint64_t ret = ctx.lr;
+		ctx.lr = exit_trap.trap_addr;
+		ctx.pc.x = target_addr;
 		contexts.emplace( // this is really dumb
 			std::piecewise_construct,
 			std::make_tuple(t),
@@ -55,20 +51,21 @@ class FunctionTrap {
 			throw ResultError(ILIA_ERR_INVALID_TRAP_STATE);
 		}
 		
-		nx::ThreadContext &ctx = t.GetContext();
-		ctx.pc = i->second.return_address;
+		ThreadContext &ctx = t.GetContext();
+		ctx.pc.x = i->second.return_address;
 		contexts.erase(i);
 	}
 
-	Process &process;
  private:
 	Process::Trap entry_trap;
 	Process::Trap exit_trap;
  public:
-	const uint64_t entry_trap_addr;
-	const uint64_t target_addr;
+	Process &process;
  private:
 	Arg &cons_param;
+ public:
+	const uint64_t target_addr;
+	const uint64_t entry_trap_addr;
 	
 	struct InternalContext {
 		InternalContext(uint64_t r, Process::Thread &t, Arg &cons_param) :
@@ -148,9 +145,10 @@ class StackHolder {
 	~StackHolder() {
 		thread.GetContext().sp+= sizeof(T);
 	}
-	const uint64_t addr;
  private:
 	Process::Thread &thread;
+ public:
+	const uint64_t addr;
 };
 
 // just provides some fields to keep track of things that you were going to need to keep track of
@@ -197,17 +195,17 @@ template<typename Context>
 class SmartContext : public CommonContext<typename Context::Owner> {
  public:
 	SmartContext(typename Context::Owner &owner, Process::Thread &thread) :
-		thread_context(thread.GetContext()),
 		CommonContext<typename Context::Owner>(owner, thread),
+		thread_context(thread.GetContext()),
 		context(ConstructionHelper(std::make_index_sequence<std::tuple_size<typename Context::Arguments>::value>())) {
 	}
  private:
-	nx::ThreadContext &thread_context;
+	ThreadContext &thread_context;
 	Context context;
 	
 	template<std::size_t... I>
 	Context ConstructionHelper(std::index_sequence<I...>) {
-		return Context(this->owner, this->thread, (detail::UnpackingHelper<typename std::tuple_element<I, typename Context::Arguments>::type>::Unpack(this->process, thread_context.x[I]))...);
+		return Context(this->owner, this->thread, (detail::UnpackingHelper<typename std::tuple_element<I, typename Context::Arguments>::type>::Unpack(this->process, thread_context.cpu_gprs[I].x))...);
 	}
 };
 
