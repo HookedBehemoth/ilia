@@ -29,6 +29,10 @@ Process::Process(
 	ilia.event_waiter.Add(debug, [this] { HandleEvents(); });
 }
 
+Process::~Process() {
+	svcCloseHandle(debug);
+}
+
 Process::Thread::Thread(Process &process, uint64_t id, uint64_t tls, uint64_t entrypoint) :
 	process(process),
 	thread_id(id),

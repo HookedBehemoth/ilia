@@ -23,8 +23,7 @@
 #include<string>
 #include<vector>
 #include<type_traits>
-#include<optional>
-#include<tuple>
+#include<span>
 
 #include<stdint.h>
 
@@ -33,27 +32,24 @@ namespace util {
 
 class Buffer {
 public:
-	Buffer();
+	Buffer(size_t size);
 	~Buffer();
 
 	// reserves at least `size` bytes, returns a tuple of
 	// the write head pointer and a size of how many bytes
 	// can be written. call MarkWritten to mark how many
 	// bytes were actually read.
-	std::tuple<uint8_t*, size_t> Reserve(size_t size);
+	std::span<uint8_t> Reserve(size_t size);
 	void MarkWritten(size_t size);
 
-	void Write(const char *data);
 	void Write(const uint8_t *data, size_t size);
 	
 	template<typename T>
-	void Write(std::vector<T> data) {
+	void Write(std::span<T> data) {
 		static_assert(std::is_standard_layout<T>::value, "T must be standard layout");
 		Write((uint8_t*) data.data(), sizeof(T) * data.size());
 	}
 
-	void Write(std::string &str);
-	
 	template<typename T>
 	void Write(T t) {
 		static_assert(std::is_standard_layout<T>::value, "T must be standard layout");
@@ -72,16 +68,15 @@ public:
 	}
 
 	template<typename T>
-	bool Read(std::vector<T> &vec) {
+	bool Read(std::span<T> vec) {
 		static_assert(std::is_standard_layout<T>::value, "T must be standard layout");
-		T temp;
 		return Read((uint8_t*) vec.data(), sizeof(T) * vec.size());
 	}
 
 	bool Read(std::string &str, size_t size);
 	
 	bool Read(Buffer &other, size_t size) {
-		if(Read(std::get<0>(other.Reserve(size)), size)) {
+		if(Read(other.Reserve(size))) {
 			other.MarkWritten(size);
 			return true;
 		}
@@ -95,7 +90,7 @@ public:
 	}
 
 	template<typename T>
-	static size_t Size(std::vector<T> &vec) {
+	static size_t Size(std::span<T> &vec) {
 		static_assert(std::is_standard_layout<T>::value, "T must be standard layout");
 		return vec.size() * sizeof(T);
 	}
@@ -113,11 +108,7 @@ public:
 	size_t ReadAvailable();
 	size_t WriteAvailableHint();
 
-	std::vector<uint8_t> GetData();
-
 	void Compact(); // guarantees that data pending read won't be moved around
-
-	std::string GetString();
 private:
 	std::vector<uint8_t> data;
 	size_t read_head = 0;

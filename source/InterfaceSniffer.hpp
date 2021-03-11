@@ -4,6 +4,7 @@
 #include "Process.hpp"
 #include "Traps.hpp"
 #include "nn_sf.hpp"
+#include "Buffer.hpp"
 
 namespace ilia {
 
@@ -33,13 +34,10 @@ class InterfaceSniffer {
 		~MessageContext();
 
 	 private:
+	 	util::Buffer out_buffer;
 		Process::RemotePointer<nn::sf::cmif::server::CmifServerMessage> message;
-		nn::sf::detail::PointerAndSize rq_pas;
-		std::vector<uint8_t> rq_data;
 		std::optional<nn::sf::cmif::CmifMessageMetaInfo> meta_info;
 		std::optional<nn::sf::detail::PointerAndSize> rs_pas;
-		std::optional<std::vector<uint8_t>> rs_data;
-		std::optional<std::vector<std::vector<uint8_t>>> buffers;
 		
 		class PrepareForProcess : public CommonContext<MessageContext> {
 			// nn::Result CmifServerMessage::PrepareForProcess(CmifMessageMetaInfo *info);

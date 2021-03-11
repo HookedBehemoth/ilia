@@ -1,6 +1,6 @@
 #pragma once
 
-#include<vector>
+#include<cstdio>
 
 namespace ilia {
 namespace pcapng {
@@ -18,6 +18,8 @@ const uint32_t SHB_USERAPPL = 4;
 const uint32_t LINKTYPE_USER0 = 147; // HIPC message
 const uint32_t LINKTYPE_USER1 = 148; // CMIF message
 
+const uint32_t WTAP_MAX_PACKET_SIZE_STANDARD = 0x4'0000;
+
 class Writer {
   public:
    Writer(FILE *file);
@@ -30,12 +32,8 @@ class Writer {
   private:
    FILE *file;
    
-   std::vector<uint8_t> block_buffer;
-
-   void OpenBlock(uint32_t block_type);
-   void AppendToBlock(const uint8_t *data, size_t size);
-   void AppendOptions(Option *options);
-   void CommitBlock();
+   void WriteOptions(Option *options);
+   uint32_t GetOptionSize(Option *options);
 
    int interface_id = 0;
 };

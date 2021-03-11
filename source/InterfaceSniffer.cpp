@@ -1,8 +1,7 @@
 #include "InterfaceSniffer.hpp"
 
 #include<experimental/array>
-
-#include "Buffer.hpp"
+#include<algorithm>
 
 namespace ilia {
 
@@ -37,23 +36,6 @@ InterfaceSniffer::InterfaceSniffer(Ilia &ilia, Process::STable &s_table) :
 	fprintf(stderr, "made interface sniffer for %s\n", s_table.interface_name.c_str());
 }
 
-InterfaceSniffer::MessageContext::MessageContext(
-	InterfaceSniffer &sniffer,
-	Process::Thread &thread,
-	uint64_t object,
-	Process::RemotePointer<nn::sf::cmif::server::CmifServerMessage> message,
-	Process::RemotePointer<nn::sf::detail::PointerAndSize> pas) :
-	CommonContext<InterfaceSniffer>(sniffer, thread),
-	message(message),
-	rq_pas(*pas),
-	rq_data(rq_pas.size),
-	vtable(*this, thread.process, (*message).vtable),
-	holder(thread, vtable.trap_vtable) {
-	//fprintf(stderr, "entering message handling context for thread 0x%lx\n", thread.thread_id);
-	process.ReadBytes(rq_data, rq_pas.pointer);
-	message = {holder.addr}; // poison vtable
-}
-
 enum class ChunkType : uint8_t {
 	RequestPas,
 	RequestData,
@@ -64,67 +46,53 @@ enum class ChunkType : uint8_t {
 	Buffers,
 };
 
-static void AddChunk(util::Buffer &message, ChunkType type, util::Buffer &chunk) {
-	message.Write<ChunkType>(type);
-	message.Write<size_t>(chunk.ReadAvailable());
-	chunk.Read(message, chunk.ReadAvailable());
-}
-
 template<typename T>
 static void MakeChunk(util::Buffer &message, ChunkType type, T &t) {
-	message.Write<ChunkType>(type);
-	message.Write<size_t>(util::Buffer::Size(t));
+	message.Write(type);
+	message.Write(util::Buffer::Size(t));
 	message.Write(t);
 }
 
+InterfaceSniffer::MessageContext::MessageContext(
+	InterfaceSniffer &sniffer,
+	Process::Thread &thread,
+	uint64_t object,
+	Process::RemotePointer<nn::sf::cmif::server::CmifServerMessage> message,
+	Process::RemotePointer<nn::sf::detail::PointerAndSize> pas) :
+	CommonContext<InterfaceSniffer>(sniffer, thread),
+	out_buffer(pcapng::WTAP_MAX_PACKET_SIZE_STANDARD),
+	message(message),
+	vtable(*this, thread.process, (*message).vtable),
+	holder(thread, vtable.trap_vtable) {
+	// fprintf(stderr, "entering message handling context for thread 0x%lx\n", thread.thread_id);
+
+	auto rq_pas = *pas;
+	// RequestPas
+	MakeChunk(out_buffer, ChunkType::RequestPas, rq_pas);
+
+	if (out_buffer.ReadAvailable() + rq_pas.size < pcapng::WTAP_MAX_PACKET_SIZE_STANDARD) {
+		// RequestData
+		out_buffer.Write(ChunkType::RequestData);
+		out_buffer.Write(rq_pas.size);
+		auto dst = out_buffer.Reserve(rq_pas.size);
+		process.ReadBytes({ dst.data(), rq_pas.size }, rq_pas.pointer);
+		out_buffer.MarkWritten(rq_pas.size);
+	} else {
+		fprintf(stderr, "Writing ResponseData of size: 0x%lx would excede WTAP_MAX_PACKET_SIZE_STANDARD. Skipping!\n", rq_pas.size);
+	}
+
+	message = {holder.addr}; // poison vtable
+}
+
 InterfaceSniffer::MessageContext::~MessageContext() {
-	try {
 	//fprintf(stderr, "leaving message handling context for thread 0x%lx\n", thread.thread_id);
 	message = {vtable.real_vtable_addr}; // restore vtable
 
 	uint32_t result = (uint32_t) thread.GetContext().cpu_gprs[0].x;
 
-	// commit message
-	util::Buffer message;
-	{ // ResultCode
-		MakeChunk(message, ChunkType::ResultCode, result);
-	}
-	{ // RequestPas
-		util::Buffer chunk;
-		chunk.Write<uint64_t>(rq_pas.pointer);
-		chunk.Write<uint64_t>(rq_pas.size);
-		AddChunk(message, ChunkType::RequestPas, chunk);
-	}
-	{ // RequestData
-		MakeChunk(message, ChunkType::RequestData, rq_data);
-	}
-	if(meta_info) { // MetaInfo
-		MakeChunk(message, ChunkType::MetaInfo, *meta_info);
-	}
-	if(rs_pas) { // ResponsePas
-		util::Buffer chunk;
-		chunk.Write<uint64_t>(rs_pas->pointer);
-		chunk.Write<uint64_t>(rs_pas->size);
-		AddChunk(message, ChunkType::ResponsePas, chunk);
-	}
-	if(rs_data) { // ResponseData
-		MakeChunk(message, ChunkType::ResponseData, *rs_data);
-	}
-	if(buffers) { // Buffers
-		util::Buffer chunk;
-		for(auto &i : *buffers) {
-			chunk.Write<uint64_t>(i.size());
-			chunk.Write(i);
-		}
-		AddChunk(message, ChunkType::Buffers, chunk);
-	}
+	MakeChunk(out_buffer, ChunkType::ResultCode, result);
 
-	owner.ilia.pcap_writer.WriteEPB(owner.interface_id, armTicksToNs(armGetSystemTick()), message.ReadAvailable(), message.ReadAvailable(), message.Read(), nullptr);
-	} catch (std::exception &e) {
-		fprintf(stderr, "caught exception %s\n", e.what());
-	} catch (...) {
-		fprintf(stderr, "caught exception\n");
-	}
+	owner.ilia.pcap_writer.WriteEPB(owner.interface_id, armTicksToNs(armGetSystemTick()) / 1000, out_buffer.ReadAvailable(), out_buffer.ReadAvailable(), out_buffer.Read(), nullptr);
 }
 
 InterfaceSniffer::MessageContext::PrepareForProcess::PrepareForProcess(
@@ -134,6 +102,7 @@ InterfaceSniffer::MessageContext::PrepareForProcess::PrepareForProcess(
 	Process::RemotePointer<nn::sf::cmif::CmifMessageMetaInfo> info) :
 	CommonContext<MessageContext>(ctx, thread) {
 	owner.meta_info.emplace(*info);
+	MakeChunk(owner.out_buffer, ChunkType::MetaInfo, *owner.meta_info);
 }
 
 InterfaceSniffer::MessageContext::BeginPreparingForReply::BeginPreparingForReply(
@@ -156,11 +125,26 @@ InterfaceSniffer::MessageContext::SetBuffers::SetBuffers(
 	Process::RemotePointer<nn::sf::detail::PointerAndSize> pas_array) :
 	CommonContext<MessageContext>(ctx, thread) {
 	if(owner.meta_info) {
-		owner.buffers.emplace(owner.meta_info->buffer_count);
-		for(size_t i = 0; i < owner.meta_info->buffer_count; i++) {
-			nn::sf::detail::PointerAndSize pas = pas_array[i];
-			(*owner.buffers)[i].resize(pas.size);
-			process.ReadBytes((*owner.buffers)[i], pas.pointer);
+		// Calculate total buffer size
+		size_t buffer_size = owner.meta_info->buffer_count * sizeof(uint64_t);
+		for (size_t i = 0; i < owner.meta_info->buffer_count; i++)
+			buffer_size += pas_array[i].size;
+		if (owner.out_buffer.ReadAvailable() + buffer_size < pcapng::WTAP_MAX_PACKET_SIZE_STANDARD) {
+			// Write buffer head
+			owner.out_buffer.Write(ChunkType::Buffers);
+			owner.out_buffer.Write(buffer_size);
+			auto span = owner.out_buffer.Reserve(buffer_size);
+			auto ptr = span.data();
+			for(size_t i = 0; i < owner.meta_info->buffer_count; i++) {
+				nn::sf::detail::PointerAndSize pas = pas_array[i];
+				*reinterpret_cast<uint64_t*>(ptr) = pas.size;
+				ptr += sizeof(uint64_t);
+				process.ReadBytes({ptr, pas.size}, pas.pointer);
+				ptr += pas.size;
+			}
+			owner.out_buffer.MarkWritten(buffer_size);
+		} else {
+			fprintf(stderr, "Writing ResponseData of size: 0x%lx would excede WTAP_MAX_PACKET_SIZE_STANDARD. Skipping!\n", buffer_size);
 		}
 	} else {
 		fprintf(stderr, "WARNING: SetBuffers called without PrepareForProcess?\n");
@@ -173,8 +157,19 @@ InterfaceSniffer::MessageContext::EndPreparingForReply::EndPreparingForReply(
 	uint64_t _this) :
 	CommonContext<MessageContext>(ctx, thread) {
 	if(owner.rs_pas) {
-		owner.rs_data.emplace(owner.rs_pas->size);
-		process.ReadBytes(*owner.rs_data, owner.rs_pas->pointer);
+		auto rs_pas = *owner.rs_pas;
+		// ResponsePas
+		MakeChunk(owner.out_buffer, ChunkType::ResponsePas, rs_pas);
+		// ResponseData
+		if (owner.out_buffer.ReadAvailable() + rs_pas.size < pcapng::WTAP_MAX_PACKET_SIZE_STANDARD) {
+			owner.out_buffer.Write(ChunkType::ResponseData);
+			owner.out_buffer.Write(rs_pas.size);
+			auto dst = owner.out_buffer.Reserve(rs_pas.size);
+			process.ReadBytes({ dst.data(), rs_pas.size }, rs_pas.pointer);
+			owner.out_buffer.MarkWritten(rs_pas.size);
+		} else {
+			fprintf(stderr, "Writing ResponseData of size: 0x%lx would excede WTAP_MAX_PACKET_SIZE_STANDARD. Skipping!\n", rs_pas.size);
+		}
 	}
 }
 

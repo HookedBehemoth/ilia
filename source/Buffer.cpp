@@ -26,8 +26,8 @@
 namespace ilia {
 namespace util {
 
-Buffer::Buffer() :
-	data(256 * 1024, 0) {
+Buffer::Buffer(size_t size) :
+	data(size, 0) {
 }
 
 Buffer::~Buffer() {
@@ -39,20 +39,9 @@ void Buffer::Write(const uint8_t *io, size_t size) {
 	write_head+= size;
 }
 
-void Buffer::Write(const char *str) {
-	size_t size = strlen(str);
+std::span<uint8_t> Buffer::Reserve(size_t size) {
 	EnsureSpace(size);
-	std::copy_n(str, size, data.begin() + write_head);
-	write_head+= size;
-}
-
-void Buffer::Write(std::string &string) {
-	Write((uint8_t*) string.data(), string.size());
-}
-
-std::tuple<uint8_t*, size_t> Buffer::Reserve(size_t size) {
-	EnsureSpace(size);
-	return std::make_tuple(data.data() + write_head, data.size() - write_head);
+	return { data.data() + write_head, data.size() - write_head };
 }
 
 void Buffer::MarkWritten(size_t size) {
@@ -111,14 +100,6 @@ void Buffer::Compact() {
 	std::copy(data.begin() + read_head, data.end(), data.begin());
 	write_head-= read_head;
 	read_head = 0;
-}
-
-std::vector<uint8_t> Buffer::GetData() {
-	return std::vector<uint8_t>(data.begin() + read_head, data.begin() + write_head);
-}
-
-std::string Buffer::GetString() {
-	return std::string(data.begin() + read_head, data.begin() + write_head);
 }
 
 } // namespace util

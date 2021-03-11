@@ -1,15 +1,4 @@
-#include<algorithm>
-#include<iterator>
-#include<vector>
-
-#include<string.h>
-#include<stdio.h>
-#include<stdlib.h>
-#include<unistd.h>
-
 #include "pcapng.hpp"
-#include "err.hpp"
-#include "assert.hpp"
 
 namespace ilia {
 namespace pcapng {
@@ -17,34 +6,33 @@ namespace pcapng {
 Writer::Writer(FILE *file) : file(file) {
 }
 
-void Writer::OpenBlock(uint32_t block_type) {
-   block_buffer.resize(8, 0);
-	((uint32_t*) block_buffer.data())[0] = block_type;
+template<typename T>
+static void WriteData(FILE *file, T &t) {
+	fwrite(&t, sizeof(T), 1, file);
 }
 
-void Writer::CommitBlock() {
-   block_buffer.insert(block_buffer.end(), 4, 0);
-   ((uint32_t*) block_buffer.data())[1] = block_buffer.size();
-   *((uint32_t*) (block_buffer.data() + block_buffer.size() - 4)) = block_buffer.size();
-   if(fwrite(block_buffer.data(), 1, block_buffer.size(), file) != block_buffer.size()) {
-      throw ResultError(ILIA_ERR_IO_ERROR);
-   }
-   fflush(file);
-}
-
-void Writer::AppendToBlock(const uint8_t *data, size_t size) {
-   std::copy_n(data, size, std::back_inserter(block_buffer));   
-}
-
-void Writer::AppendOptions(Option *options) {
+void Writer::WriteOptions(Option *options) {
 	for(int i = 0; options != NULL && options[i].code != 0; i++) {
-		AppendToBlock((uint8_t*) &options[i], 4);
-		AppendToBlock((uint8_t*) options[i].value, options[i].length);
-		uint32_t zero = 0;
-		AppendToBlock((uint8_t*) &zero, ((block_buffer.size() + 3) & ~3) - block_buffer.size());
+		fwrite(&options[i], sizeof(uint16_t), 2, file);
+		fwrite(options[i].value, options[i].length, 1, file);
+		uint8_t zeros[4] = {};
+		fwrite(zeros, 1, ((options[i].length + 3) & ~3) - options[i].length, file);
 	}
 	Option end = {.code = 0, .length = 0, .value = NULL};
-	AppendToBlock((uint8_t*) &end, 4);
+	fwrite(&end, sizeof(uint16_t), 2, file);
+}
+
+uint32_t Writer::GetOptionSize(Option *options) {
+	uint32_t size = 0;
+
+	for(int i = 0; options != NULL && options[i].code != 0; i++) {
+		size += sizeof(options[i].code);   // code
+		size += sizeof(options[i].length); // length
+		size += (options[i].length + 3) & ~3;
+	}
+	size += 4; // end
+
+	return size;
 }
 
 void Writer::WriteSHB(Option *options) {
@@ -53,18 +41,20 @@ void Writer::WriteSHB(Option *options) {
 		uint16_t major;
 		uint16_t minor;
 		int64_t length;
-	} shb_head;
+	} shb_head = { .bom = 0x1A2B3C4D, .major=1, .minor=0, .length=-1 };
 
-	OpenBlock(0x0A0D0D0A);
-	
-	shb_head.bom = 0x1A2B3C4D; // byte order magic
-	shb_head.major = 1;
-	shb_head.minor = 0;
-	shb_head.length = -1;
+	const uint32_t type = 0x0A0D0D0A;
+	const uint32_t total_size = sizeof(uint32_t) // Block Type
+							  + sizeof(uint32_t) // Block Total Length
+							  + sizeof(shb_head)
+							  + GetOptionSize(options)
+							  + sizeof(uint32_t); // Block Total Length
 
-	AppendToBlock((uint8_t*) &shb_head, sizeof(shb_head));
-	AppendOptions(options);
-	CommitBlock();
+	WriteData(file, type);
+	WriteData(file, total_size);
+	WriteData(file, shb_head);
+	WriteOptions(options);
+	WriteData(file, total_size);
 
 	interface_id = 0; // local to section
 }
@@ -74,17 +64,20 @@ uint32_t Writer::WriteIDB(uint16_t link_type, uint32_t snap_len, Option *options
 		uint16_t link_type;
 		uint16_t reserved;
 		uint32_t snap_len;
-	} idb_head;
+	} idb_head = { .link_type = link_type, .reserved = 0, .snap_len = snap_len };
 
-	OpenBlock(0x1);
+	const uint32_t type = 0x1;
+	const uint32_t total_size = sizeof(uint32_t) // Block Type
+							  + sizeof(uint32_t) // Block Total Length
+							  + sizeof(idb_head)
+							  + GetOptionSize(options)
+							  + sizeof(uint32_t); // Block Total Length
 
-	idb_head.link_type = link_type;
-	idb_head.reserved = 0;
-	idb_head.snap_len = snap_len;
-
-	AppendToBlock((uint8_t*) &idb_head, sizeof(idb_head));
-	AppendOptions(options);
-	CommitBlock();
+	WriteData(file, type);
+	WriteData(file, total_size);
+	WriteData(file, idb_head);
+	WriteOptions(options);
+	WriteData(file, total_size);
 
 	return interface_id++;
 }
@@ -96,22 +89,30 @@ void Writer::WriteEPB(uint32_t if_id, uint64_t timestamp, uint32_t cap_length, u
 		uint32_t ts_lo;
 		uint32_t cap_length;
 		uint32_t orig_length;
-	} epb_head;
+	} epb_head = {
+		.if_id = if_id,
+		.ts_hi = static_cast<uint32_t>(timestamp >> 32),
+		.ts_lo = static_cast<uint32_t>(timestamp & 0xFFFFFFFF),
+		.cap_length = cap_length,
+		.orig_length = orig_length
+	};
+	
+	const uint32_t type = 0x6;
+	const uint32_t total_size = sizeof(uint32_t) // Block Type
+							  + sizeof(uint32_t) // Block Total Length
+							  + sizeof(epb_head)
+							  + GetOptionSize(options)
+							  + ((cap_length + 3) & ~3)
+							  + sizeof(uint32_t); // Block Total Length
 
-	OpenBlock(0x6);
-
-	epb_head.if_id = if_id;
-	epb_head.ts_hi = timestamp >> 32;
-	epb_head.ts_lo = timestamp & 0xFFFFFFFF;
-	epb_head.cap_length = cap_length;
-	epb_head.orig_length = orig_length;
-
-	AppendToBlock((uint8_t*) &epb_head, sizeof(epb_head));
-	AppendToBlock((uint8_t*) data, cap_length);
-	uint32_t zero = 0;
-	AppendToBlock((uint8_t*) &zero, ((block_buffer.size() + 3) & ~3) - block_buffer.size());
-	AppendOptions(options);
-	CommitBlock();
+	WriteData(file, type);
+	WriteData(file, total_size);
+	WriteData(file, epb_head);
+	fwrite(data, cap_length, 1, file);
+	uint8_t zeros[4] = {};
+	fwrite(zeros, 1, ((cap_length + 3) & ~3) - cap_length, file);
+	WriteOptions(options);
+	WriteData(file, total_size);
 }
 
 } // namespace pcapng
