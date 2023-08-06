@@ -1,5 +1,7 @@
 #pragma once
 
+#include<optional>
+
 #include "Ilia.hpp"
 #include "Process.hpp"
 #include "Traps.hpp"
